@@ -252,7 +252,13 @@ async def handle_on_bot_message(request: Request, db: Session = Depends(get_db))
         card_text = f"💡 [b]ДЕНЬ {user.current_day}: {nudge.theme}[/b]\n\n{nudge.text}\n\n📖 Источник: {nudge.source}" if nudge else "Карточка культуры загружается..."
         
         call_bitrix("im.notify.system.add", {"USER_ID": user_id, "MESSAGE": card_text})
-        call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": f"⚙️ [Демо-Режим]: Переключаю вас на День {user.current_day} адаптации. Карточка отправлена в уведомления!"})
+        
+        welcome_rich_message = (
+            f"⚙️ [b][Демо-Режим]: Переключено на День {user.current_day} адаптации![/b]\n\n"
+            f"💡 [b]Тема дня: {nudge.theme if nudge else ''}[/b]\n\n"
+            f"🎯 [b][URL=/market/placement/kmg_digital_buddy_front/]НАЖМИТЕ СЮДА, ЧТОБЫ ОТКРЫТЬ ИНТЕРАКТИВНУЮ ПАНЕЛЬ[/URL][/b] и прочитать карточку корпоративной этики!"
+        )
+        call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": welcome_rich_message})
         return {"status": "ok"}
 
     lang = "kk" if any(char in set("әғқңөұүһіӘҒҚҢӨҰҮҺІ") for char in message) else "ru"
@@ -312,8 +318,8 @@ async def get_iframe_page(request: Request):
                     <a href="https://team.kmg.kz/video-pp" target="_blank" class="video-btn">▶️ Смотреть видеообращение</a>
                 </div>
                 <div class="task-box">
-                    <h4>📌 Ближайшая незакрытая задача маршрута:</h4>
-                    <p id="task_title">-</p>
+                    <h4 id="task_header">📌 Ближайшая незакрытая задача маршрута:</h4>
+                    <p id="task_title" style="white-space: pre-wrap;">-</p>
                 </div>
                 <div class="progress-container">
                     <div class="progress-labels">
@@ -350,6 +356,7 @@ async def get_iframe_page(request: Request):
                             dataLoaded = true;
                             currentBotId = data.bot_id || "10";
                             document.getElementById('greeting_text').innerHTML = data.greeting;
+                            document.getElementById('task_header').innerText = data.next_task.header || "📌 Ближайшая незакрытая задача маршрута:";
                             document.getElementById('task_title').innerText = data.next_task.title;
                             document.getElementById('progress_text').innerText = data.progress.text;
                             document.getElementById('progress_bar').style.width = ((data.progress.completed / data.progress.total) * 100) + "%";
@@ -397,16 +404,43 @@ async def get_popup_data(user_id: str):
                 first_name = user_list[0].get("NAME", "Сотрудник")
 
         current_day = user.current_day if user else 1
-        completed = db.query(Task).filter(Task.employee_id == numeric_id, Task.is_completed == True).count()
-        uncompleted = db.query(Task).filter(Task.employee_id == numeric_id, Task.is_completed == False).first()
         
-        return {
-            "status": "success",
-            "bot_id": "10",
-            "greeting": f"Добрый день, {first_name}! День {current_day} вашей адаптации в КМГ.",
-            "next_task": {"title": uncompleted.title if uncompleted else "Все задачи успешно закрыты!"},
-            "progress": {"text": f"Выполнено {completed} из 5 задач", "completed": completed, "total": 5}
-        }
+        if current_day == 1:
+            completed = db.query(Task).filter(Task.employee_id == numeric_id, Task.is_completed == True).count()
+            uncompleted = db.query(Task).filter(Task.employee_id == numeric_id, Task.is_completed == False).first()
+            task_title = uncompleted.title if uncompleted else "Все задачи первого дня успешно выполнены!"
+            return {
+                "status": "success",
+                "bot_id": "10",
+                "greeting": f"Добрый день, {first_name}! День {current_day} вашей адаптации в КМГ.",
+                "next_task": {
+                    "header": "📌 Ближайшая незакрытая задача:",
+                    "title": task_title
+                },
+                "progress": {
+                    "text": f"Выполнено {completed} из 5 задач",
+                    "completed": completed,
+                    "total": 5
+                }
+            }
+        else:
+            nudge = db.query(NudgeCard).filter(NudgeCard.day == current_day).first()
+            card_title = nudge.theme if nudge else "Тема дня"
+            card_content = f"{nudge.text}\n\n📖 Источник: {nudge.source}" if nudge else "Карточка культуры загружается..."
+            return {
+                "status": "success",
+                "bot_id": "10",
+                "greeting": f"Добрый день, {first_name}! День {current_day} вашей адаптации в КМГ.",
+                "next_task": {
+                    "header": f"💡 Правило дня {current_day}: {card_title}",
+                    "title": card_content
+                },
+                "progress": {
+                    "text": f"Изучено {current_day} из 23 правил культуры",
+                    "completed": current_day,
+                    "total": 23
+                }
+            }
     finally:
         db.close()
 
