@@ -1,4 +1,5 @@
 import os
+# pyrefly: ignore [missing-import]
 import fitz  # PyMuPDF
 import chromadb
 from chromadb.utils import embedding_functions

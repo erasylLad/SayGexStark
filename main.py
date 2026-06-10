@@ -45,6 +45,7 @@ def get_db():
 def call_bitrix(method: str, params: dict):
     webhook_url = os.getenv("BITRIX_REST_URL")
     if not webhook_url:
+        print("⚠️ [BITRIX ERROR] Переменная BITRIX_REST_URL отсутствует в .env!", flush=True)
         return None
     try:
         if method in ["tasks.task.add", "tasks.task.get"]:
@@ -53,13 +54,13 @@ def call_bitrix(method: str, params: dict):
             response = requests.post(f"{webhook_url}{method}", data=params)
         return response.json()
     except Exception as e:
-        print(f"[ERROR] Bitrix24 метод {method} упал: {e}")
+        print(f"❌ [ERROR] Ошибка вызова метода {method}: {e}", flush=True)
         return None
 
 # --- КРОН-ПРОВЕРКА 16:00 ---
 
 def check_tasks_final_cron_1600():
-    print("\n⏰ [CRON 16:00] Запуск итоговой проверки выполнения задач...")
+    print("\n⏰ [CRON 16:00] Запуск итоговой проверки выполнения задач...", flush=True)
     db = SessionLocal()
     try:
         active_users = db.query(User).filter(User.current_day == 1).all()
@@ -90,7 +91,7 @@ def check_tasks_final_cron_1600():
 
 @app.on_event("startup")
 def on_startup():
-    print("🚀 Жесткая проверка таблиц PostgreSQL...")
+    print("🚀 Жесткая проверка таблиц PostgreSQL...", flush=True)
     init_db()
     seed_nudges.seed_data()
     rag_service.init_mock_vnd_data()
@@ -104,39 +105,94 @@ def on_startup():
 @app.post("/webhooks/login")
 @app.post("/webhooks/on_user_login")
 async def handle_on_user_login(request: Request, db: Session = Depends(get_db)):
-    form_data = await request.form()
+    form_data = {}
+    try:
+        form_data = await request.form()
+        form_data = dict(form_data)
+    except Exception:
+        try:
+            form_data = await request.json()
+        except Exception:
+            pass
+
+    print(f"\n📥 [WEBHOOK RECEIVED] Входящие данные: {form_data}", flush=True)
+    
     incoming_id = (
         form_data.get("data[FIELDS_AFTER][ID]") or 
         form_data.get("user_id") or 
+        form_data.get("id") or
         form_data.get("data[USER][ID]") or
-        form_data.get("data[PARAMS][FROM_USER_ID]")
+        form_data.get("data[PARAMS][FROM_USER_ID]") or
+        form_data.get("data[PARAMS][USER_ID]") or
+        request.query_params.get("user_id")
     )
+    
     if not incoming_id:
+        print("⚠️ [WEBHOOK SKIPPED] Не удалось извлечь ID. Пропуск.", flush=True)
         return {"status": "error", "message": "Missing ID"}
+
+    event = form_data.get("event", "")
+    user_id = None
+
+    if "TASK" in str(event) or "data[FIELDS_AFTER][ID]" in form_data:
+        task_id = incoming_id
+        print(f"🔍 Событие задачи ID {task_id}. Запрашиваем структуру из Битрикс24...", flush=True)
+        task_res = call_bitrix("tasks.task.get", {"id": task_id})
         
-    user_id = int(incoming_id)
+        if isinstance(task_res, dict) and task_res.get("result"):
+            task_data = task_res["result"].get("task", {})
+            if isinstance(task_data, dict):
+                task_title = task_data.get("title", "")
+                
+                stop_words = ["Инструктаж", "Кодекс", "Комплаенс", "пропускным режимом", "Культура KMG", "Digital Buddy"]
+                if any(word in task_title for word in stop_words):
+                    print(f"🛑 [LOOP PROTECTION] Пропуск нашей же задачи '{task_title}' во избежание цикла.", flush=True)
+                    return {"status": "skipped", "reason": "loop_protection"}
+                
+                raw_user = task_data.get("responsibleId") or task_data.get("createdBy")
+                if raw_user:
+                    user_id = int(raw_user)
+    else:
+        user_id = int(incoming_id)
+        
+    if not user_id:
+        user_id = 1
+
+    print(f"🎯 Истинный ID сотрудника для назначения онбординга определен: {user_id}", flush=True)
+    
     user = db.query(User).filter(User.id == user_id).first()
     
     name = "Новый сотрудник"
     user_res = call_bitrix("user.get", {"id": user_id})
-    if isinstance(user_res, dict) and user_res.get("result") and len(user_res["result"]) > 0:
-        name = user_res["result"].get("NAME", "Сотрудник")
+    
+    # ЖЕСТКОЕ ИСПРАВЛЕНИЕ: Безопасное извлечение имени из списка
+    if isinstance(user_res, dict) and user_res.get("result"):
+        user_list = user_res["result"]
+        if isinstance(user_list, list) and len(user_list) > 0:
+            name = user_list[0].get("NAME", "Сотрудник")
+    
+    print(f"👤 Назначаем пакет документов на имя: {name}", flush=True)
 
-    # Симулируем генерацию 5 задач
     db.query(Task).filter(Task.employee_id == user_id).delete()
     if not user:
         user = User(id=user_id, fullname=name, start_date=date.today(), current_day=1, sent_today=True)
         db.add(user)
     else:
+        user.fullname = name
         user.current_day = 1
+        user.sent_today = True
     db.commit()
 
+    print(f"🛠_ Создание 5 регламентированных инструктажей в Битрикс24...", flush=True)
     tasks = ["Инструктаж по ТБ", "Инструктаж по ИБ", "Ознакомление с пропускным режимом", "Кодекс деловой этики", "Модуль Комплаенс"]
+    
+    created_count = 0
     for t_title in tasks:
         res = call_bitrix("tasks.task.add", {
             "fields": {
                 "TITLE": f"{t_title} для нового сотрудника",
                 "RESPONSIBLE_ID": user_id,
+                "DESCRIPTION": "Обязательный вводный курс АО «НК «КазМунайГаз».",
                 "DEADLINE": f"{datetime.now().strftime('%Y-%m-%d')}T18:00:00+05:00"
             }
         })
@@ -144,7 +200,10 @@ async def handle_on_user_login(request: Request, db: Session = Depends(get_db)):
             t_id = res["result"].get("task", {}).get("id")
             if t_id:
                 db.add(Task(id=str(t_id), title=t_title, employee_id=user_id))
+                created_count += 1
     db.commit()
+
+    print(f"✅ Инструктажи успешно сгенерированы: {created_count}/5", flush=True)
 
     welcome_rich_message = (
         f"🚀 [b]Добро пожаловать в АО «НК «КазМунайГаз», {name}![/b]\n\n"
@@ -152,7 +211,7 @@ async def handle_on_user_login(request: Request, db: Session = Depends(get_db)):
         f"🎯 [b][URL=/market/placement/kmg_digital_buddy_front/]НАЖМИТЕ СЮДА, ЧТОБЫ ОТКРЫТЬ ИНТЕРАКТИВНУЮ ПАНЕЛЬ[/URL][/b] и запустить видеообращение Председателя Правления!"
     )
     call_bitrix("imbot.message.add", {"BOT_ID": "10", "DIALOG_ID": user_id, "MESSAGE": welcome_rich_message})
-    return {"status": "success", "tasks": "created"}
+    return {"status": "success", "tasks_created": created_count}
 
 # --- ИИ ЧАТ + ДЕМО-РЕЖИМЫ ---
 
@@ -175,12 +234,14 @@ async def handle_on_bot_message(request: Request, db: Session = Depends(get_db))
         db.add(user)
         db.commit()
 
-    # СЕКРЕТНЫЙ ТРИГГЕР 1: ДЕМО СИМУЛЯЦИЯ 5 ЗАДАЧ
     if message == "тест задачи":
-        await handle_on_user_login(request, db)
+        print(f"🏁 [DEMO] Запуск генерации задач для ID {user_id}", flush=True)
+        class MockRequest:
+            query_params = {"user_id": str(user_id)}
+            async def form(self): return {"user_id": str(user_id)}
+        await handle_on_user_login(MockRequest(), db)
         return {"status": "ok"}
 
-    # СЕКРЕТНЫЙ ТРИГГЕР 2: ДЕМО СИМУЛЯЦИЯ 23 КАРТОЧЕК КУЛЬТУРЫ
     if message == "тест культура":
         user.current_day += 1
         if user.current_day > 23:
@@ -191,14 +252,14 @@ async def handle_on_bot_message(request: Request, db: Session = Depends(get_db))
         card_text = f"💡 [b]ДЕНЬ {user.current_day}: {nudge.theme}[/b]\n\n{nudge.text}\n\n📖 Источник: {nudge.source}" if nudge else "Карточка культуры загружается..."
         
         call_bitrix("im.notify.system.add", {"USER_ID": user_id, "MESSAGE": card_text})
-        call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": f"⚙️ [Демо-Режим]: Переключаю вас на День {user.current_day} адаптации. Карточка корпоративной культуры отправлена вам в уведомления (колокольчик)!"})
+        call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": f"⚙️ [Демо-Режим]: Переключаю вас на День {user.current_day} адаптации. Карточка отправлена в уведомления!"})
         return {"status": "ok"}
 
-    # Стандартный ответ ИИ по коду
     lang = "kk" if any(char in set("әғқңөұүһіӘҒҚҢӨҰҮҺІ") for char in message) else "ru"
     answer = rag_service.query_rag(message, lang=lang)
     call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": answer})
     return {"status": "ok"}
+
 
 # --- КОНТЕКСТНОЕ ОКНО DIGITAL BUDDY (IFRAME) ---
 
@@ -328,8 +389,12 @@ async def get_popup_data(user_id: str):
         first_name = "Сотрудник"
         
         user_res = call_bitrix("user.get", {"id": numeric_id})
-        if isinstance(user_res, dict) and user_res.get("result") and len(user_res["result"]) > 0:
-            first_name = user_res["result"].get("NAME", "Сотрудник")
+        
+        # ЖЕСТКОЕ ИСПРАВЛЕНИЕ ТАКЖЕ И В ЭНДПОИНТЕ API ПОПАПА
+        if isinstance(user_res, dict) and user_res.get("result"):
+            user_list = user_res["result"]
+            if isinstance(user_list, list) and len(user_list) > 0:
+                first_name = user_list[0].get("NAME", "Сотрудник")
 
         current_day = user.current_day if user else 1
         completed = db.query(Task).filter(Task.employee_id == numeric_id, Task.is_completed == True).count()
