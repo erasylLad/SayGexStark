@@ -218,23 +218,53 @@ async def handle_on_user_login(request: Request, db: Session = Depends(get_db)):
 @app.post("/bot/message")
 @app.post("/webhooks/on_bot_message")
 async def handle_on_bot_message(request: Request, db: Session = Depends(get_db)):
-    form_data = await request.form()
-    user_id_raw = form_data.get("data[PARAMS][FROM_USER_ID]") or form_data.get("user_id")
-    message = (form_data.get("data[PARAMS][MESSAGE]") or form_data.get("message", "")).strip().lower()
-    dialog_id = form_data.get("data[PARAMS][DIALOG_ID]")
-    bot_id = form_data.get("data[PARAMS][TO_USER_ID]") or "10"
+    form_data = {}
+    try:
+        form_data = await request.form()
+        form_data = dict(form_data)
+    except Exception:
+        try:
+            form_data = await request.json()
+        except Exception:
+            pass
+
+    print(f"\n📥 [BOT MESSAGE RECEIVED] Входящие данные: {form_data}", flush=True)
+
+    user_id_raw = (
+        form_data.get("data[PARAMS][FROM_USER_ID]") or 
+        form_data.get("user_id") or 
+        (form_data.get("data", {}).get("PARAMS", {}).get("FROM_USER_ID") if isinstance(form_data.get("data"), dict) else None)
+    )
+    message = (
+        form_data.get("data[PARAMS][MESSAGE]") or 
+        form_data.get("message") or
+        (form_data.get("data", {}).get("PARAMS", {}).get("MESSAGE") if isinstance(form_data.get("data"), dict) else "")
+    )
+    dialog_id = (
+        form_data.get("data[PARAMS][DIALOG_ID]") or
+        (form_data.get("data", {}).get("PARAMS", {}).get("DIALOG_ID") if isinstance(form_data.get("data"), dict) else None)
+    )
+    bot_id = (
+        form_data.get("data[PARAMS][TO_USER_ID]") or
+        (form_data.get("data", {}).get("PARAMS", {}).get("TO_USER_ID") if isinstance(form_data.get("data"), dict) else "10")
+    )
     
     if not user_id_raw or not message:
+        print("⚠️ [BOT MESSAGE SKIPPED] Отсутствует user_id или сообщение.", flush=True)
         return {"status": "ignored"}
 
     user_id = int(user_id_raw)
+    message_str = str(message).strip().lower()
+    
+    print(f"👤 Сообщение от пользователя {user_id}: '{message_str}'", flush=True)
+
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         user = User(id=user_id, fullname="Сотрудник КМГ", current_day=1, sent_today=False)
         db.add(user)
         db.commit()
 
-    if message == "тест задачи":
+    if message_str == "тест задачи":
         print(f"🏁 [DEMO] Запуск генерации задач для ID {user_id}", flush=True)
         class MockRequest:
             query_params = {"user_id": str(user_id)}
@@ -242,7 +272,7 @@ async def handle_on_bot_message(request: Request, db: Session = Depends(get_db))
         await handle_on_user_login(MockRequest(), db)
         return {"status": "ok"}
 
-    if message == "тест культура":
+    if message_str == "тест культура":
         user.current_day += 1
         if user.current_day > 23:
             user.current_day = 1
@@ -258,12 +288,16 @@ async def handle_on_bot_message(request: Request, db: Session = Depends(get_db))
             f"💡 [b]Тема дня: {nudge.theme if nudge else ''}[/b]\n\n"
             f"🎯 [b][URL=/market/placement/kmg_digital_buddy_front/]НАЖМИТЕ СЮДА, ЧТОБЫ ОТКРЫТЬ ИНТЕРАКТИВНУЮ ПАНЕЛЬ[/URL][/b] и прочитать карточку корпоративной этики!"
         )
-        call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": welcome_rich_message})
+        res_rich = call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": welcome_rich_message})
+        print(f"   ℹ️ Ответ Битрикса на приветственное демо-сообщение: {res_rich}", flush=True)
         return {"status": "ok"}
 
-    lang = "kk" if any(char in set("әғқңөұүһіӘҒҚҢӨҰҮҺІ") for char in message) else "ru"
-    answer = rag_service.query_rag(message, lang=lang)
-    call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": answer})
+    lang = "kk" if any(char in set("әғқңөұүһіӘҒҚҢӨҰҮҺІ") for char in message_str) else "ru"
+    answer = rag_service.query_rag(message_str, lang=lang)
+    
+    print(f"📤 Отвечаем пользователю через imbot.message.add (BOT_ID={bot_id}, DIALOG_ID={dialog_id or user_id})", flush=True)
+    res_reply = call_bitrix("imbot.message.add", {"BOT_ID": bot_id, "DIALOG_ID": dialog_id or user_id, "MESSAGE": answer})
+    print(f"   ℹ️ Ответ Битрикса на отправку сообщения: {res_reply}", flush=True)
     return {"status": "ok"}
 
 
